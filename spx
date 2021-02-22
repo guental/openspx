@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+import sys, os, hashlib, secrets, keyring, binascii, hashlib, hmac
+from codecs import encode
+from codecs import decode
+from io import DEFAULT_BUFFER_SIZE
+from pyspx import shake256_256s as spx
+from getpass import getuser
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305 as chacha20
+
+app_name = "OpenSPX"
+sys.tracebacklimit = 10
+exit_code = 0
+arg_parse = 1
+arg_sign = 0
+arg_test = 0
+public_mode = 0
+shake = hashlib.shake_256()
+keysize = ( spx.crypto_sign_PUBLICKEYBYTES + spx.crypto_sign_SECRETKEYBYTES ) * 2
+keyfilesize = spx.crypto_sign_PUBLICKEYBYTES + spx.crypto_sign_SECRETKEYBYTES + 44
+service_name = "SPHINCS+"
+username = getuser()
+rootdir = "/home/" + username
+cachedir = rootdir + "/.cache"
+keydir = cachedir + "/spx"
+keypath = keydir + "/keyring"
+
+def getenckey(service_name, username):
+	if keyring.get_password(service_name, username):
+		key = decode(keyring.get_password(service_name, username), 'hex')
+		return key
+	else:
+		return None
+		
+def chaenc(pubsec):
+	if not os.path.exists(keypath):
+		key = getenckey(service_name, username)
+		nonce = os.urandom(12)
+		salt = os.urandom(16)
+		key = hashlib.shake_256(salt + key).digest(32)
+		cha = chacha20(key)
+		encdata = nonce + salt + cha.encrypt(nonce, pubsec, associated_data=None)
+		encpath = open(keypath, 'wb')
+		encpath.write(encdata)
+
+def chadec(datapath):
+	key = getenckey(service_name, username)
+	if key == None:
+		return None, None
+	openfile = open(datapath, 'rb')
+	data = openfile.read(keyfilesize)
+	nonce = data[:12]
+	salt = data[12:]
+	salt = salt[:16]
+	data = data[28:]
+	key = hashlib.shake_256(salt + key).digest(32)
+	cha = chacha20(key)
+	decdata = cha.decrypt(nonce, data, associated_data=None)
+	pub = decdata[:64]
+	sec = decdata[-128:]
+	return pub, sec
+
+def shake256_calc(filename):
+	with open(filename, 'rb') as openfile:
+		while True:
+			data = openfile.read(DEFAULT_BUFFER_SIZE)
+			if not data:
+				break
+			shake.update(data)
+	shake256 = shake.digest(64)
+	return shake256
+
+def set_key():
+	if not keyring.get_password(service_name, username):
+		print(app_name + ":", "keyring: generating keys", file=sys.stderr)
+		seed = secrets.token_bytes(spx.crypto_sign_SEEDBYTES)
+		pub, sec = spx.generate_keypair(seed)
+		key = seed.hex()
+		keyring.set_password(service_name, username, key)
+		pubsec = pub + sec
+		chaenc(pubsec)
+		return pub, sec
+	if os.path.exists(keypath):
+		try:
+			pub, sec = chadec(keypath)
+			return pub, sec
+		except InvalidTag:
+			os.remove(keypath)
+	else:
+		seed = decode(keyring.get_password(service_name, username), 'hex')
+		pub, sec = spx.generate_keypair(seed)
+		pubsec = pub + sec
+		chaenc(pubsec)
+		return pub, sec
+		
+def spx_write(filename, shake256, sig, pub):
+	if spx.verify(shake256, sig, pub):
+		with open(filename, 'wb') as openfile:
+			if openfile.write(sig):
+				return True
+			else:
+				return False
+		return False
+	else:
+		return False
+
+def spx_verify(filename, pub):
+	if os.path.exists(filename):
+		shake256 = shake256_calc(filename)
+	else:
+		return False
+	with open(filename + ".sig", 'rb') as openfile:
+		sig = openfile.read(spx.crypto_sign_BYTES)
+	if not len(sig) == spx.crypto_sign_BYTES:
+		return False
+	if spx.verify(shake256, sig, pub):
+		return True
+	else:
+		return False
+
+def key_import():
+	if keyring.get_password(service_name, username):
+		return True
+	openfile = open("/dev/stdin", 'r')
+	key = openfile.read(keyfilesize)
+	if not decode(key, 'hex'):
+		return False
+	keyring.set_password(service_name, username, key)
+	if keyring.get_password(service_name, username):
+		return True
+	else:
+		return False
+
+if __name__ == '__main__':
+	if not os.path.isdir(keydir):
+		if not os.path.isfile(keydir):
+			if not os.path.isdir(cachedir):
+				os.mkdir(cachedir)
+			os.mkdir(keydir)
+		else:
+			print(app_name + ":", "~/.spx" + ": Is a file", file=sys.stderr)
+			sys.exit(1)
+	pub, sec = set_key()
+	if len(sys.argv) < 2:
+		sys.exit(0)
+	else:
+		for arg in sys.argv[1:]:
+			arg_stdin = 0
+			if public_mode == 1:
+				if not decode(arg, 'hex'):
+					print(app_name + ":", "public-import: FAILED", file=sys.stderr)
+				pub = decode(arg, 'hex')
+				public_mode = 0
+				continue
+			if arg_parse == 1:
+				if arg in ['--export-seed']:
+					if keyring.get_password(service_name, username):
+						print(app_name + ":", "export: OK", file=sys.stderr)
+						print(keyring.get_password(service_name, username))					
+						sys.exit(0)
+					else:
+						print(app_name + ":", "export: FAILED", file=sys.stderr)
+						sys.exit(1)
+				elif arg in ['--import-seed']:
+					if key_import():
+						print(app_name + ":", "import: OK", file=sys.stderr)
+						sys.exit(0)
+					else:
+						print(app_name + ":", "import: FAILED", file=sys.stderr)
+						sys.exit(1)
+				elif arg in ['-p', '-i', '--public', '--public-import']:
+					public_mode = 1
+					arg_test = 1
+					continue
+				elif arg in ['-e', '--public-export']:
+					if keyring.get_password(service_name, username):
+						seed = decode(keyring.get_password(service_name, username), 'hex')
+						pub, sec = spx.generate_keypair(seed)
+						print(app_name + ":", "public export: OK", file=sys.stderr)
+						print(pub.hex())
+						sys.exit(0)
+					else:
+						print(app_name + ":", "public export: FAILED", file=sys.stderr)
+						sys.exit(1)
+				elif arg in ['-s', '--sign']:
+					arg_sign = 1
+					arg_test = 0
+					continue
+				elif arg in ['-v', '--verify']:
+					arg_sign = 0
+					arg_test = 1
+					continue
+				elif arg in ['--']:
+					arg_parse = 0
+					continue
+			if os.path.isfile(arg + ".sig"):
+				if arg_sign == 1:
+					continue
+				if spx_verify(arg, pub):
+					print(arg + ": OK")
+				else:
+					print(arg + ": FAILED")
+					exit_code = 1
+				continue
+			if arg_test == 1:
+				continue
+			if arg in ['-']:
+				continue
+			if os.path.isdir(arg):
+				print(app_name + ":", arg + ": Is a directory", file=sys.stderr)
+				exit_code = 1
+			elif os.path.exists(arg):
+				try:
+					with open(arg) as f:
+						filepath = arg
+				except IOError:
+					print(app_name + ":", arg + ": Permission denied", file=sys.stderr)
+					exit_code = 1
+					continue
+				shake256_hash = shake256_calc(filepath)
+				sig = spx.sign(shake256_hash, sec)
+				if spx_write(filepath + ".sig", shake256_hash, sig, pub):
+					print(arg + ".sig: OK")
+				else:
+					print(arg + ".sig: FAILED")
+					exit_code = 1
+			else:
+				print(app_name + ":", arg + ": No such file or directory", file=sys.stderr)
+				exit_code = 1
+
+sys.exit(exit_code)
